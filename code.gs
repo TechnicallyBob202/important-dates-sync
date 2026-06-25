@@ -249,8 +249,9 @@ function isAlreadySynced(person, events) {
       const cBday = (person.birthdays||[])[0]?.date||null;
       return cBday && birthdayMonthDayMatch(event.dateObj, cBday);
     }
-    const et = event.dateType==='anniversary'?'anniversary':'custom';
-    return (person.events||[]).some(e=>e.type===et && datesMatch(e.date,event.dateObj));
+    // For non-birthday events, match by date only — type may differ between
+    // sync runs (e.g. 'anniversary' vs 'custom') so don't require type match
+    return (person.events||[]).some(e => datesMatch(e.date, event.dateObj));
   });
 }
 
@@ -891,6 +892,337 @@ function executeCardAction(card, action, actionData) {
 }
 
 
+// ─── Duplicate Date Cleanup ──────────────────────────────────────────────────
+
+/**
+ * Scans ALL Google Contacts for duplicate dates (same month/day across
+ * birthdays + events on the same contact). Returns cards for sidebar review.
+ */
+function getDuplicateDatesData() {
+  const allContacts = getAllContacts();
+  const cards = [];
+
+  for (const person of allContacts) {
+    const cFirst = (person.names||[{}])[0].givenName  || '';
+    const cLast  = (person.names||[{}])[0].familyName || '';
+    const cName  = (person.names||[{}])[0].displayName || [cFirst,cLast].filter(Boolean).join(' ');
+    if (!cName) continue;
+
+    // Collect all dates on this contact
+    const dates = [];
+
+    for (const b of person.birthdays||[]) {
+      if (!b.date) continue;
+      const isProfile = (b.metadata?.source?.type||'').toUpperCase() === 'PROFILE';
+      dates.push({
+        kind:      'birthday',
+        label:     'Birthday',
+        dateObj:   b.date,
+        dateStr:   formatDateObj(b.date),
+        readOnly:  isProfile,
+        sourceNote: isProfile ? '(Google profile — read-only)' : '',
+      });
+    }
+
+    for (const e of person.events||[]) {
+      if (!e.date) continue;
+      dates.push({
+        kind:      'event',
+        label:     e.formattedType || e.type || 'Event',
+        dateObj:   e.date,
+        dateStr:   formatDateObj(e.date),
+        readOnly:  false,
+        sourceNote: '',
+      });
+    }
+
+    if (dates.length < 2) continue;
+
+    // Find duplicate month/day pairs
+    const dupes = [];
+    for (let i = 0; i < dates.length; i++) {
+      for (let j = i + 1; j < dates.length; j++) {
+        if (birthdayMonthDayMatch(dates[i].dateObj, dates[j].dateObj)) {
+          // Add both if not already in list
+          if (!dupes.find(d => d.kind===dates[i].kind && d.label===dates[i].label && d.dateStr===dates[i].dateStr)) {
+            dupes.push(dates[i]);
+          }
+          if (!dupes.find(d => d.kind===dates[j].kind && d.label===dates[j].label && d.dateStr===dates[j].dateStr)) {
+            dupes.push(dates[j]);
+          }
+        }
+      }
+    }
+
+    if (!dupes.length) continue;
+
+    cards.push({
+      id:           `dupe-${person.resourceName}`,
+      resourceName: person.resourceName,
+      displayName:  cName,
+      firstName:    cFirst,
+      lastName:     cLast,
+      dupes,
+      result:       '',
+    });
+  }
+
+  return { cards };
+}
+
+/**
+ * Remove a specific date from a contact.
+ * kind: 'birthday' | 'event'
+ * label: the formattedType/label to match for events
+ * dateStr: used to match the specific date if multiple events share a label
+ */
+function removeDuplicateDate(resourceName, kind, label, dateStr) {
+  try {
+    const current = getFullContact(resourceName);
+    const body    = { etag: current.etag };
+    const fields  = [];
+
+    if (kind === 'birthday') {
+      // Only remove CONTACT-sourced birthdays; profile ones are read-only
+      const kept = (current.birthdays||[]).filter(b =>
+        (b.metadata?.source?.type||'').toUpperCase() === 'PROFILE'
+      );
+      body.birthdays = kept;
+      fields.push('birthdays');
+
+      // Clear col D from sheet if this contact has a matching row
+      const ss    = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName(CONTACTS_SHEET);
+      if (sheet) {
+        const indexes = buildIndexes([current]);
+        const data    = sheet.getDataRange().getValues();
+        for (let i = 1; i < data.length; i++) {
+          const row   = data[i];
+          const first = String(row[CCOL.FIRST-1]||'').trim();
+          const last  = String(row[CCOL.LAST -1]||'').trim();
+          const email = String(row[CCOL.EMAIL-1]||'').trim();
+          const { person } = matchInMemory(first, last, email, indexes);
+          if (person && person.resourceName === resourceName) {
+            sheet.getRange(i+1, CCOL.BIRTHDAY).clearContent();
+            break;
+          }
+        }
+      }
+
+    } else {
+      // Remove the specific event matching label + date
+      const kept = (current.events||[]).filter(e => {
+        const eLabel = e.formattedType || e.type || '';
+        const eDate  = formatDateObj(e.date);
+        return !(eLabel === label && eDate === dateStr);
+      });
+      body.events = kept;
+      fields.push('events');
+    }
+
+    People.People.updateContact(body, resourceName, { updatePersonFields: fields.join(',') });
+    return { success: true, result: `✅ Removed ${label} (${dateStr})` };
+
+  } catch(e) {
+    Logger.log(`removeDuplicateDate error (${resourceName}): ${e.message}`);
+    return { success: false, result: `❌ ${e.message}` };
+  }
+}
+
+function openCleanupSidebar() {
+  const html = HtmlService.createHtmlOutput(getCleanupSidebarHtml())
+    .setTitle('🧹 Duplicate Date Cleanup')
+    .setWidth(320);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function getCleanupSidebarHtml() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Google Sans',Arial,sans-serif;font-size:13px;color:#202124;background:#f1f3f4}
+  #hdr{background:white;padding:12px 14px 10px;border-bottom:1px solid #e0e0e0;position:sticky;top:0;z-index:10}
+  #hdr h2{font-size:14px;font-weight:600;color:#c5221f;margin-bottom:4px}
+  #hdr p{font-size:11px;color:#5f6368}
+  #content{padding:10px}
+  .card{background:white;border:1px solid #e0e0e0;border-radius:8px;padding:10px 12px;margin-bottom:8px}
+  .card.done{opacity:.55}
+  .card-name{font-weight:600;font-size:13px;margin-bottom:6px}
+  .date-row{display:flex;justify-content:space-between;align-items:center;
+    padding:5px 8px;border-radius:5px;background:#fef7e0;margin-bottom:4px;font-size:12px}
+  .date-row.readonly{background:#f1f3f4;color:#9aa0a6}
+  .date-info{flex:1}
+  .date-label{font-weight:500}
+  .date-str{color:#5f6368;margin-left:6px}
+  .date-note{font-size:10px;color:#9aa0a6;display:block}
+  .result{font-size:11px;margin-top:6px;padding:4px 8px;border-radius:4px}
+  .r-ok{background:#e6f4ea;color:#137333}
+  .r-err{background:#fce8e6;color:#c5221f}
+  .r-skip{background:#f1f3f4;color:#5f6368}
+  .actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+  .btn{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid #dadce0;
+    background:white;cursor:pointer;font-family:inherit;transition:background .1s}
+  .btn.remove{color:#c5221f;border-color:#f4c2c2}
+  .btn.remove:hover:not(:disabled){background:#fce8e6}
+  .btn.skip{color:#5f6368}
+  .btn.skip:hover:not(:disabled){background:#f1f3f4}
+  .btn:disabled{opacity:.4;cursor:default}
+  .spin{display:inline-block;width:10px;height:10px;border:2px solid #dadce0;
+    border-top-color:#c5221f;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #loader{text-align:center;padding:40px 20px;color:#5f6368;font-size:12px}
+  #loader .spin{width:20px;height:20px;border-width:3px;border-top-color:#c5221f}
+  .empty{text-align:center;color:#9aa0a6;padding:32px 16px;font-size:12px;line-height:1.8}
+  .summary{font-size:11px;color:#5f6368;margin-top:4px}
+  #refresh-btn{font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid #dadce0;
+    background:white;cursor:pointer;color:#5f6368;margin-left:8px}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <div style="display:flex;align-items:center;justify-content:space-between">
+    <h2>🧹 Duplicate Date Cleanup</h2>
+    <button id="refresh-btn" onclick="load()" style="display:none">↻ Re-scan</button>
+  </div>
+  <p id="subtitle">Scanning your Google Contacts…</p>
+</div>
+<div id="content">
+  <div id="loader"><div class="spin"></div><br><br>Scanning all contacts for duplicate dates…</div>
+</div>
+
+<script>
+let CARDS = [];
+
+function load() {
+  document.getElementById('refresh-btn').style.display = 'none';
+  document.getElementById('subtitle').textContent = 'Scanning your Google Contacts…';
+  document.getElementById('content').innerHTML =
+    '<div id="loader"><div class="spin"></div><br><br>Scanning all contacts for duplicate dates…</div>';
+  CARDS = [];
+  google.script.run
+    .withSuccessHandler(data => {
+      CARDS = data.cards || [];
+      render();
+      document.getElementById('refresh-btn').style.display = '';
+    })
+    .withFailureHandler(e => {
+      document.getElementById('content').innerHTML =
+        '<div class="empty" style="color:#c5221f">❌ ' + esc(e.message) + '</div>';
+    })
+    .getDuplicateDatesData();
+}
+load();
+
+const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const isDone = c => !!(c.result && c.result.length);
+
+function render() {
+  const pending = CARDS.filter(c => !isDone(c));
+  const done    = CARDS.filter(c =>  isDone(c));
+
+  document.getElementById('subtitle').textContent =
+    pending.length
+      ? pending.length + ' contact(s) with duplicate dates'
+      : done.length ? 'All done!' : 'No duplicate dates found.';
+
+  const con = document.getElementById('content');
+  con.innerHTML = '';
+
+  if (!CARDS.length) {
+    con.innerHTML = '<div class="empty">🎉 No duplicate dates found across your Google Contacts!</div>';
+    return;
+  }
+
+  pending.forEach(c => con.appendChild(makeCard(c)));
+
+  if (done.length) {
+    const div = document.createElement('div');
+    div.style.cssText = 'margin-top:14px;opacity:.6';
+    div.innerHTML = '<div style="font-size:11px;color:#5f6368;padding:4px 2px 6px;text-transform:uppercase;font-weight:600">✓ Done</div>';
+    done.forEach(c => div.appendChild(makeCard(c)));
+    con.appendChild(div);
+  }
+}
+
+function makeCard(card) {
+  const el = document.createElement('div');
+  el.className = 'card' + (isDone(card) ? ' done' : '');
+  el.id = 'card-' + card.id;
+
+  let html = '<div class="card-name">' + esc(card.displayName) + '</div>';
+
+  (card.dupes || []).forEach(d => {
+    const ro = d.readOnly;
+    html += '<div class="date-row' + (ro?' readonly':'') + '">';
+    html += '<div class="date-info">';
+    html += '<span class="date-label">' + (d.kind==='birthday'?'🎂 ':'📅 ') + esc(d.label) + '</span>';
+    html += '<span class="date-str">' + esc(d.dateStr) + '</span>';
+    if (d.sourceNote) html += '<span class="date-note">' + esc(d.sourceNote) + '</span>';
+    html += '</div></div>';
+  });
+
+  if (isDone(card)) {
+    const cls = card.result.startsWith('✅') ? 'r-ok' : card.result.startsWith('⏭') ? 'r-skip' : 'r-err';
+    html += '<div class="result ' + cls + '">' + esc(card.result) + '</div>';
+  }
+
+  el.innerHTML = html;
+
+  if (!isDone(card)) {
+    const acts = document.createElement('div');
+    acts.className = 'actions';
+    acts.id = 'act-' + card.id;
+
+    // One "Remove" button per removable dupe
+    (card.dupes || []).forEach(d => {
+      if (d.readOnly) return;
+      const b = document.createElement('button');
+      b.className = 'btn remove';
+      b.textContent = 'Remove ' + d.label;
+      b.onclick = () => removeDate(card, d, acts);
+      acts.appendChild(b);
+    });
+
+    const skip = document.createElement('button');
+    skip.className = 'btn skip';
+    skip.textContent = 'Skip';
+    skip.onclick = () => {
+      const idx = CARDS.findIndex(c => c.id === card.id);
+      if (idx >= 0) CARDS[idx].result = '⏭ Skipped';
+      render();
+    };
+    acts.appendChild(skip);
+
+    el.appendChild(acts);
+  }
+
+  return el;
+}
+
+function removeDate(card, dupe, actsEl) {
+  actsEl.innerHTML = '<span class="spin"></span> Removing…';
+  google.script.run
+    .withSuccessHandler(res => {
+      const idx = CARDS.findIndex(c => c.id === card.id);
+      if (idx >= 0) CARDS[idx].result = res.result;
+      render();
+    })
+    .withFailureHandler(e => {
+      const idx = CARDS.findIndex(c => c.id === card.id);
+      if (idx >= 0) CARDS[idx].result = '❌ ' + e.message;
+      render();
+    })
+    .removeDuplicateDate(card.resourceName, dupe.kind, dupe.label, dupe.dateStr);
+}
+</script>
+</body>
+</html>`;
+}
+
+
 // ─── Ignore List ─────────────────────────────────────────────────────────────
 
 const IGNORE_KEY = 'ignored_contacts';
@@ -1073,6 +1405,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('📅 Important Dates Sync')
     .addItem('🔍 Discover',             'openSidebar')
+    .addItem('🧹 Cleanup Duplicate Dates', 'openCleanupSidebar')
     .addItem('↩ Rollback Last Created', 'rollback')
     .addSeparator()
     .addItem('⚙ Setup Contacts Sheet', 'setupContactsSheet')
